@@ -1,0 +1,895 @@
+// autoresearch.sigil — autoresearch re-framed through "programs are neural networks".
+//
+// INPUT:  optional "<seed> [<generations>]" as text (defaults: 42, 12).
+// OUTPUT: a plain-text report (packed ptr/len) comparing two evolution arms.
+// EFFECTS: ! { Alloc }  — pure compute, no host grants, fully deterministic.
+//
+// What this is a port of. Karpathy's autoresearch mutates a training algorithm (opaque
+// source text), runs it, scores it, keeps or discards. The search space is discrete and
+// the only signal is a scalar score. Cheng Lou's Handwired shows the other half: a
+// program's control flow lowers to arithmetic + relu with compiler-ASSIGNED weights, and
+// once it is in that form the weights can be unfrozen and tuned by backprop.
+//
+// This file fuses the two. A candidate "training algorithm" here is an UPDATE RULE
+// (how an optimizer turns a gradient into a parameter step) written as a tiny program:
+//   * discrete structure  = an instruction list over a 16-register file (what an LLM
+//     would mutate in the real system; here, structural mutation + crossover);
+//   * continuous knobs    = a weight vector w[0..8) referenced by WMUL/WADD/STEP, which
+//     the hand-written seeds assign at "compile" time exactly like Handwired does, and
+//     which the hybrid arm then unfreezes and tunes by GRADIENT.
+// Three framing claims, each made testable in the output rather than asserted:
+//   1. Differentiable seed programs — the interpreter runs on dual numbers (forward-mode
+//      AD), so d(final loss)/d(w_k) is exact through the whole unrolled inner loop.
+//   2. Smoother fitness landscape — `STEP` lowers a comparator to relu(x)-relu(x-1)
+//      (Handwired's ternary lowering) with a LEARNED sharpness weight: a hard branch
+//      becomes a ramp whose steepness is itself a knob. The report runs a discrete-only
+//      arm and a hybrid arm on the same seed and prints both curves side by side.
+//   3. Composing learned and hand-coded components — seeds are hand-coded SGD /
+//      momentum / step-decay compiled into the IR; the winner reports its lineage and
+//      how many of its inherited weights the gradient moved.
+//
+// Why fixed point. SIGIL is integer-only by design (the type set is i32/u32/i64/u64/
+// bool/str), so every real-valued quantity is Q16: `SCALE` is 1.0. A dual's derivative
+// field is also Q16 (d == SCALE means dv/dw == 1.0), which keeps the product rule
+// `(a*b).d = (a.v*b.d + a.d*b.v) / SCALE` dimensionally consistent with `.v`.
+// Registers are clamped to ±2^28 so a Q16 product (2^56) never approaches i64 overflow;
+// divergence shows up as a huge-but-finite loss, never a trap. Failure direction of every
+// clamp: closed — a saturated value is kept, its derivative is zeroed.
+//
+// Why the inner task is a quadratic and not a language model: the real bottleneck in
+// autoresearch is a 5-minute GPU trial per fitness evaluation; this port is about the
+// SEARCH representation, so the fitness proxy is deliberately cheap — an ill-conditioned
+// 2-D quadratic where momentum and schedule choices measurably matter. Nothing here
+// claims the proxy transfers; it claims the hybrid search machinery is sound.
+
+module tool;
+
+// ── numeric representation ───────────────────────────────────────────────────
+const SCALE: i64 = 65536;           // Q16 one
+const HALF: i64 = 32768;            // Q16 0.5
+const CLAMP: i64 = 268435456;       // 2^28 register ceiling (2^56 after a Q16 product)
+const NREG: i64 = 16;
+const NW: i64 = 8;                  // weights per program
+
+// register conventions (inputs are read-only by convention; mutation never targets 0..3)
+const R_G: i64 = 0;                 // gradient component for this coordinate
+const R_M: i64 = 1;                 // optimizer state (momentum) for this coordinate
+const R_T: i64 = 2;                 // normalized step t/T in Q16
+const R_ONE: i64 = 3;               // the constant 1.0
+const R_DELTA: i64 = 14;            // output: parameter step
+const R_MNEXT: i64 = 15;            // output: next optimizer state (defaults to R_M)
+const FIRST_WRITABLE: i64 = 4;
+
+// instruction set — the "neural network" ops
+const OP_ADD: i64 = 0;              // d = a + b
+const OP_SUB: i64 = 1;              // d = a - b
+const OP_MUL: i64 = 2;              // d = a * b
+const OP_RELU: i64 = 3;             // d = relu(a)
+const OP_WMUL: i64 = 4;             // d = a * w[b]
+const OP_WADD: i64 = 5;             // d = a + w[b]
+const OP_STEP: i64 = 6;             // d = clamp01(a * w[b])  — relu(x) - relu(x-1), learnable sharpness
+const OP_NEG: i64 = 7;              // d = -a
+const NUM_OPS: i64 = 8;
+
+// inner task: minimize (p0 - 3)^2 + 50 (p1 + 2)^2 from (-4, 3), in only 20 steps.
+// Condition number 50 with a short horizon is the point: a stable plain-SGD rate must be
+// < 0.02 (else p1 diverges), at which p0 closes only ~4%/step — so a rule that is a
+// single `g * w` cannot win, and momentum / per-step scheduling structure pays.
+const INNER_STEPS: i64 = 20;
+const TARGET0: i64 = 196608;        // 3.0
+const TARGET1: i64 = 131072;        // 2.0  (target is -2.0; written as subtraction below)
+const START0: i64 = 262144;         // 4.0  (start is -4.0)
+const START1: i64 = 196608;         // 3.0
+const CURV1: i64 = 50;              // curvature multiplier on coordinate 1
+
+// evolution
+const POP: i64 = 8;
+const ELITE: i64 = 2;
+const MAX_INSTR: i64 = 12;
+const COMPLEXITY_PENALTY: i64 = 66; // ~0.001 per instruction, in Q16
+const FINETUNE_ITERS: i64 = 3;
+const FT_STEP_INIT: i64 = 3277;     // 0.05 initial sign-step
+const FT_STEP_MAX: i64 = 13107;     // 0.20 ceiling
+const SEED_COUNT: i64 = 3;
+
+// ── records ──────────────────────────────────────────────────────────────────
+
+// A candidate algorithm. `ops/dst/a/b` are parallel instruction columns; `b` is a
+// register for ADD/SUB/MUL and a weight index for WMUL/WADD/STEP (NEG/RELU ignore it).
+// `fitness` is loss + complexity penalty (lower is better); `loss` is the raw final loss.
+record Program {
+    ops: Vec<i64>,
+    dst: Vec<i64>,
+    a: Vec<i64>,
+    b: Vec<i64>,
+    w: Vec<i64>,
+    fitness: i64,
+    loss: i64,
+    lineage: i64
+}
+
+record Rng { s: i64 }
+
+record Stats { evals: i64, grad_evals: i64, ft_accepts: i64, ft_rejects: i64 }
+
+// ── deterministic PRNG (31-bit LCG; products stay < 2^62) ────────────────────
+fn rng_next(r: Rng @Mut) -> i64 {
+    r.s = (r.s * 1103515245 + 12345) % 2147483648;
+    return r.s;
+}
+
+fn rng_below(r: Rng @Mut, n: i64) -> i64 {
+    let x: i64 = rng_next(r);
+    return (x / 65536) % n;
+}
+
+// uniform in [-range, range] (Q16)
+fn rng_signed(r: Rng @Mut, range: i64) -> i64 {
+    let span: i64 = range * 2 + 1;
+    return rng_below(r, span) - range;
+}
+
+// ── small helpers ────────────────────────────────────────────────────────────
+fn clampv(x: i64) -> i64 {
+    if x > CLAMP {
+        return CLAMP;
+    }
+    if x < 0 - CLAMP {
+        return 0 - CLAMP;
+    }
+    return x;
+}
+
+fn absv(x: i64) -> i64 {
+    if x < 0 {
+        return 0 - x;
+    }
+    return x;
+}
+
+fn imin(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+fn new_program(lineage: i64) -> Program ! { Alloc } {
+    let mut w: Vec<i64> = Vec::new();
+    let mut k: i64 = 0;
+    while k < NW {
+        let q: i64 = w.push(0);
+        k = k + 1;
+    }
+    let ops: Vec<i64> = Vec::new();
+    let dst: Vec<i64> = Vec::new();
+    let a: Vec<i64> = Vec::new();
+    let b: Vec<i64> = Vec::new();
+    return Program { ops: ops, dst: dst, a: a, b: b, w: w, fitness: 0, loss: 0, lineage: lineage };
+}
+
+fn emit_instr(p: Program @Mut, op: i64, d: i64, a: i64, b: i64) -> i64 ! { Alloc } {
+    let q1: i64 = p.ops.push(op);
+    let q2: i64 = p.dst.push(d);
+    let q3: i64 = p.a.push(a);
+    let q4: i64 = p.b.push(b);
+    return p.ops.len();
+}
+
+fn clone_program(src: Program) -> Program ! { Alloc } {
+    let out: Program = new_program(src.lineage);
+    let n: i64 = src.ops.len();
+    let mut i: i64 = 0;
+    while i < n {
+        let q: i64 = emit_instr(out, src.ops.get(i), src.dst.get(i), src.a.get(i), src.b.get(i));
+        i = i + 1;
+    }
+    let mut k: i64 = 0;
+    while k < NW {
+        let q2: i64 = out.w.set(k, src.w.get(k));
+        k = k + 1;
+    }
+    out.fitness = src.fitness;
+    out.loss = src.loss;
+    return out;
+}
+
+// ── the seeds: hand-coded optimizers "compiled" into the IR ──────────────────
+//
+// These are the hand-written programs of the framing. Each weight value below is a
+// compiler-assigned constant in Handwired's sense — correct by construction, and the
+// starting point the gradient is later allowed to move.
+
+// seed 0 — plain SGD:  delta = -lr * g ;  m' = m
+fn seed_sgd() -> Program ! { Alloc } {
+    let p: Program = new_program(0);
+    let q0: i64 = p.w.set(0, 0 - 3277);                 // w0 = -0.05  (negative learning rate)
+    let q1: i64 = emit_instr(p, OP_WMUL, R_DELTA, R_G, 0);
+    let q2: i64 = emit_instr(p, OP_ADD, R_MNEXT, R_M, R_ONE);   // deliberately imperfect: m' = m + 1 (noise the search must prune)
+    return p;
+}
+
+// seed 1 — heavy-ball momentum:  m' = beta*m + g ;  delta = -lr * m'
+fn seed_momentum() -> Program ! { Alloc } {
+    let p: Program = new_program(1);
+    let q0: i64 = p.w.set(0, 0 - 1966);                 // w0 = -0.03
+    let q1: i64 = p.w.set(1, 58982);                    // w1 =  0.90 (beta)
+    let q2: i64 = emit_instr(p, OP_WMUL, 4, R_M, 1);           // r4 = beta * m
+    let q3: i64 = emit_instr(p, OP_ADD, R_MNEXT, 4, R_G);      // m' = r4 + g
+    let q4: i64 = emit_instr(p, OP_WMUL, R_DELTA, R_MNEXT, 0); // delta = -lr * m'
+    return p;
+}
+
+// seed 2 — SGD with a step-decay schedule, lowered Handwired-style:
+//   lr(t) = lr * (1 - 0.5 * [t > 0.5])
+// The comparator `[t > 0.5]` is NOT a branch: it is STEP(t - 0.5, sharpness), i.e.
+// clamp01((t - 0.5) * k). With k large it is the hard step; with k small it is a ramp.
+// k lives in w[3], so the "smoothness of the branch" is a learnable quantity.
+fn seed_step_decay() -> Program ! { Alloc } {
+    let p: Program = new_program(2);
+    let q0: i64 = p.w.set(0, 0 - 3277);                 // w0 = -0.05 base lr (negative)
+    let q1: i64 = p.w.set(2, 0 - HALF);                 // w2 = -0.5  (threshold shift)
+    let q2: i64 = p.w.set(3, 8 * SCALE);                // w3 =  8.0  (step sharpness)
+    let q3: i64 = p.w.set(4, 0 - HALF);                 // w4 = -0.5  (decay amount)
+    let q4: i64 = p.w.set(5, SCALE);                    // w5 =  1.0
+    let q5: i64 = emit_instr(p, OP_WADD, 4, R_T, 2);           // r4 = t - 0.5
+    let q6: i64 = emit_instr(p, OP_STEP, 5, 4, 3);             // r5 = clamp01(r4 * 8)
+    let q7: i64 = emit_instr(p, OP_WMUL, 6, 5, 4);             // r6 = -0.5 * r5
+    let q8: i64 = emit_instr(p, OP_WADD, 7, 6, 5);             // r7 = r6 + 1.0   (lr multiplier)
+    let q9: i64 = emit_instr(p, OP_MUL, 8, R_G, 7);            // r8 = g * multiplier
+    let qa: i64 = emit_instr(p, OP_WMUL, R_DELTA, 8, 0);       // delta = -lr * r8
+    let qb: i64 = emit_instr(p, OP_ADD, R_MNEXT, R_M, R_M);    // m' = 2m (junk the search can delete)
+    return p;
+}
+
+fn make_seed(which: i64) -> Program ! { Alloc } {
+    if which == 0 {
+        return seed_sgd();
+    }
+    if which == 1 {
+        return seed_momentum();
+    }
+    return seed_step_decay();
+}
+
+fn lineage_name(l: i64) -> str {
+    if l == 0 {
+        return "sgd";
+    }
+    if l == 1 {
+        return "momentum";
+    }
+    return "step-decay";
+}
+
+// ── the differentiable interpreter ───────────────────────────────────────────
+//
+// Runs the candidate update rule for INNER_STEPS on the quadratic, per coordinate,
+// on DUAL numbers. `dk` selects which weight carries the derivative seed (d = 1.0);
+// pass -1 for a plain value-only evaluation (every derivative stays 0). Returns
+// (final_loss, d final_loss / d w[dk]) in Q16. This is claim 1 made executable: the
+// program is the network, and the whole unrolled optimization is differentiated.
+//
+// Fuel: ~INNER_STEPS * 2 * (NREG + n_instr) back-edges per call (~3k at n=12).
+fn run_inner(p: Program, dk: i64) -> (i64, i64) {
+    let mut rv: [i64; 16] = [0; 16];
+    let mut rd: [i64; 16] = [0; 16];
+    let n: i64 = p.ops.len();
+
+    let mut p0v: i64 = 0 - START0;
+    let mut p0d: i64 = 0;
+    let mut p1v: i64 = START1;
+    let mut p1d: i64 = 0;
+    let mut m0v: i64 = 0;
+    let mut m0d: i64 = 0;
+    let mut m1v: i64 = 0;
+    let mut m1d: i64 = 0;
+
+    let mut t: i64 = 0;
+    while t < INNER_STEPS {
+        let tnorm: i64 = (t * SCALE) / INNER_STEPS;
+        let mut c: i64 = 0;
+        while c < 2 {
+            // analytic gradient of the quadratic, as a dual
+            let mut gv: i64 = 0;
+            let mut gd: i64 = 0;
+            let mut mv: i64 = 0;
+            let mut md: i64 = 0;
+            if c == 0 {
+                gv = 2 * (p0v - TARGET0);
+                gd = 2 * p0d;
+                mv = m0v;
+                md = m0d;
+            } else {
+                gv = 2 * CURV1 * (p1v + TARGET1);
+                gd = 2 * CURV1 * p1d;
+                mv = m1v;
+                md = m1d;
+            }
+            gv = clampv(gv);
+            gd = clampv(gd);
+
+            let mut i: i64 = 0;
+            while i < NREG {
+                rv[i] = 0;
+                rd[i] = 0;
+                i = i + 1;
+            }
+            rv[R_G] = gv;
+            rd[R_G] = gd;
+            rv[R_M] = mv;
+            rd[R_M] = md;
+            rv[R_T] = tnorm;
+            rv[R_ONE] = SCALE;
+            rv[R_MNEXT] = mv;
+            rd[R_MNEXT] = md;
+
+            let mut k: i64 = 0;
+            while k < n {
+                let op: i64 = p.ops.get(k);
+                let d: i64 = p.dst.get(k);
+                let ai: i64 = p.a.get(k);
+                let bi: i64 = p.b.get(k);
+                let av: i64 = rv[ai];
+                let ad: i64 = rd[ai];
+                let mut ov: i64 = 0;
+                let mut od: i64 = 0;
+                if op == OP_ADD {
+                    ov = av + rv[bi];
+                    od = ad + rd[bi];
+                } else {
+                    if op == OP_SUB {
+                        ov = av - rv[bi];
+                        od = ad - rd[bi];
+                    } else {
+                        if op == OP_MUL {
+                            let bv: i64 = rv[bi];
+                            let bd: i64 = rd[bi];
+                            ov = (av * bv) / SCALE;
+                            od = (av * bd + ad * bv) / SCALE;
+                        } else {
+                            if op == OP_RELU {
+                                if av > 0 {
+                                    ov = av;
+                                    od = ad;
+                                }
+                            } else {
+                                if op == OP_NEG {
+                                    ov = 0 - av;
+                                    od = 0 - ad;
+                                } else {
+                                    // weight-bearing ops: the dual of w[bi] carries the seed when bi == dk
+                                    let wv: i64 = p.w.get(bi);
+                                    let mut wd: i64 = 0;
+                                    if bi == dk {
+                                        wd = SCALE;
+                                    }
+                                    if op == OP_WMUL {
+                                        ov = (av * wv) / SCALE;
+                                        od = (av * wd + ad * wv) / SCALE;
+                                    } else {
+                                        if op == OP_WADD {
+                                            ov = av + wv;
+                                            od = ad + wd;
+                                        } else {
+                                            // OP_STEP: relu(x) - relu(x - 1) == clamp01(x), x = a * w
+                                            let xv: i64 = (av * wv) / SCALE;
+                                            let xd: i64 = (av * wd + ad * wv) / SCALE;
+                                            if xv <= 0 {
+                                                ov = 0;
+                                                od = 0;
+                                            } else {
+                                                if xv >= SCALE {
+                                                    ov = SCALE;
+                                                    od = 0;
+                                                } else {
+                                                    ov = xv;
+                                                    od = xd;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                rv[d] = clampv(ov);
+                rd[d] = clampv(od);
+                k = k + 1;
+            }
+
+            if c == 0 {
+                p0v = clampv(p0v + rv[R_DELTA]);
+                p0d = clampv(p0d + rd[R_DELTA]);
+                m0v = rv[R_MNEXT];
+                m0d = rd[R_MNEXT];
+            } else {
+                p1v = clampv(p1v + rv[R_DELTA]);
+                p1d = clampv(p1d + rd[R_DELTA]);
+                m1v = rv[R_MNEXT];
+                m1d = rd[R_MNEXT];
+            }
+            c = c + 1;
+        }
+        t = t + 1;
+    }
+
+    let e0: i64 = p0v - TARGET0;
+    let e1: i64 = p1v + TARGET1;
+    let l0v: i64 = (e0 * e0) / SCALE;
+    let l0d: i64 = (2 * e0 * p0d) / SCALE;
+    // divide BEFORE the curvature multiply: e1*e1 can reach 2^56, and 50x that overflows
+    let l1v: i64 = CURV1 * ((e1 * e1) / SCALE);
+    let l1d: i64 = CURV1 * ((2 * e1 * p1d) / SCALE);
+    return (l0v + l1v, l0d + l1d);
+}
+
+// Value-only evaluation; stores loss and fitness on the program.
+fn evaluate(p: Program @Mut, st: Stats @Mut) -> i64 {
+    let (lv, ld) = run_inner(p, 0 - 1);
+    st.evals = st.evals + 1;
+    p.loss = lv;
+    p.fitness = lv + COMPLEXITY_PENALTY * p.ops.len();
+    return p.fitness;
+}
+
+// ── gradient fine-tuning of the continuous knobs (claim 1 in action) ─────────
+//
+// Forward-mode gives one exact directional derivative per pass, so the gradient costs
+// NW passes. Magnitudes in Q16 span many decades (a diverging rule has loss ~2^44), so
+// the step is sign-based with a shared adaptive size (Rprop-like) and is accepted only
+// if it lowers fitness — fail closed: a rejected step is reverted and the size halves.
+// Returns the number of accepted steps.
+fn finetune(p: Program @Mut, st: Stats @Mut, iters: i64) -> i64 {
+    let mut step: i64 = FT_STEP_INIT;
+    let mut accepted: i64 = 0;
+    let mut saved: [i64; 8] = [0; 8];
+    let mut grad: [i64; 8] = [0; 8];
+    let mut it: i64 = 0;
+    while it < iters {
+        let base: i64 = evaluate(p, st);
+        let mut any: bool = false;
+        let mut k: i64 = 0;
+        while k < NW {
+            let (lv, ld) = run_inner(p, k);
+            st.grad_evals = st.grad_evals + 1;
+            grad[k] = ld;
+            if ld != 0 {
+                any = true;
+            }
+            k = k + 1;
+        }
+        if any {
+            k = 0;
+            while k < NW {
+                saved[k] = p.w.get(k);
+                if grad[k] > 0 {
+                    let q: i64 = p.w.set(k, saved[k] - step);
+                }
+                if grad[k] < 0 {
+                    let q2: i64 = p.w.set(k, saved[k] + step);
+                }
+                k = k + 1;
+            }
+            let after: i64 = evaluate(p, st);
+            if after < base {
+                accepted = accepted + 1;
+                st.ft_accepts = st.ft_accepts + 1;
+                step = imin((step * 3) / 2, FT_STEP_MAX);
+            } else {
+                k = 0;
+                while k < NW {
+                    let q3: i64 = p.w.set(k, saved[k]);
+                    k = k + 1;
+                }
+                let restored: i64 = evaluate(p, st);
+                st.ft_rejects = st.ft_rejects + 1;
+                step = step / 2;
+            }
+        } else {
+            it = iters;
+        }
+        it = it + 1;
+    }
+    return accepted;
+}
+
+// ── structural mutation + crossover (the discrete half of the search) ────────
+fn random_src(r: Rng @Mut) -> i64 {
+    return rng_below(r, NREG);
+}
+
+fn random_dst(r: Rng @Mut) -> i64 {
+    return FIRST_WRITABLE + rng_below(r, NREG - FIRST_WRITABLE);
+}
+
+fn random_b(r: Rng @Mut, op: i64) -> i64 {
+    if op == OP_WMUL || op == OP_WADD || op == OP_STEP {
+        return rng_below(r, NW);
+    }
+    return rng_below(r, NREG);
+}
+
+fn mutate(src: Program, r: Rng @Mut) -> Program ! { Alloc } {
+    let p: Program = clone_program(src);
+    let n: i64 = p.ops.len();
+    let kind: i64 = rng_below(r, 6);
+    if kind == 0 {
+        // retarget an instruction's opcode (and re-draw its b operand to stay well-typed)
+        let i: i64 = rng_below(r, n);
+        let op: i64 = rng_below(r, NUM_OPS);
+        let q1: i64 = p.ops.set(i, op);
+        let q2: i64 = p.b.set(i, random_b(r, op));
+    }
+    if kind == 1 {
+        let i: i64 = rng_below(r, n);
+        let q: i64 = p.a.set(i, random_src(r));
+    }
+    if kind == 2 {
+        let i: i64 = rng_below(r, n);
+        let q: i64 = p.dst.set(i, random_dst(r));
+    }
+    if kind == 3 {
+        // insert a fresh instruction (appended; register dataflow makes position matter less)
+        if n < MAX_INSTR {
+            let op: i64 = rng_below(r, NUM_OPS);
+            let q: i64 = emit_instr(p, op, random_dst(r), random_src(r), random_b(r, op));
+        }
+    }
+    if kind == 4 {
+        // delete one instruction by rebuilding without it
+        if n > 1 {
+            let victim: i64 = rng_below(r, n);
+            let out: Program = new_program(p.lineage);
+            let mut i: i64 = 0;
+            while i < n {
+                if i != victim {
+                    let q: i64 = emit_instr(out, p.ops.get(i), p.dst.get(i), p.a.get(i), p.b.get(i));
+                }
+                i = i + 1;
+            }
+            let mut k: i64 = 0;
+            while k < NW {
+                let q2: i64 = out.w.set(k, p.w.get(k));
+                k = k + 1;
+            }
+            return out;
+        }
+    }
+    if kind == 5 {
+        // blind random walk on a weight — the "LLM guesses a hyperparameter" move
+        let k: i64 = rng_below(r, NW);
+        let q: i64 = p.w.set(k, p.w.get(k) + rng_signed(r, SCALE / 4));
+    }
+    return p;
+}
+
+// one-point crossover on instructions; weights interleaved by index parity
+fn crossover(pa: Program, pb: Program, r: Rng @Mut) -> Program ! { Alloc } {
+    let out: Program = new_program(pa.lineage);
+    let na: i64 = pa.ops.len();
+    let nb: i64 = pb.ops.len();
+    let cut_a: i64 = 1 + rng_below(r, na);
+    let cut_b: i64 = rng_below(r, nb + 1);
+    let mut i: i64 = 0;
+    while i < cut_a {
+        let q: i64 = emit_instr(out, pa.ops.get(i), pa.dst.get(i), pa.a.get(i), pa.b.get(i));
+        i = i + 1;
+    }
+    let mut j: i64 = cut_b;
+    while j < nb && out.ops.len() < MAX_INSTR {
+        let q2: i64 = emit_instr(out, pb.ops.get(j), pb.dst.get(j), pb.a.get(j), pb.b.get(j));
+        j = j + 1;
+    }
+    let mut k: i64 = 0;
+    while k < NW {
+        if k % 2 == 0 {
+            let q3: i64 = out.w.set(k, pa.w.get(k));
+        } else {
+            let q4: i64 = out.w.set(k, pb.w.get(k));
+        }
+        k = k + 1;
+    }
+    return out;
+}
+
+// ── population management ────────────────────────────────────────────────────
+fn sort_by_fitness(pop: Vec<Program>) -> Vec<Program> ! { Alloc } {
+    let n: i64 = pop.len();
+    let mut used: [i64; 8] = [0; 8];
+    let mut out: Vec<Program> = Vec::new();
+    let mut picked: i64 = 0;
+    while picked < n {
+        let mut best: i64 = 0 - 1;
+        let mut i: i64 = 0;
+        while i < n {
+            if used[i] == 0 {
+                if best < 0 {
+                    best = i;
+                } else {
+                    let cand: Program = pop.get(i);
+                    let cur: Program = pop.get(best);
+                    if cand.fitness < cur.fitness {
+                        best = i;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        used[best] = 1;
+        let q: i64 = out.push(pop.get(best));
+        picked = picked + 1;
+    }
+    return out;
+}
+
+// One evolutionary arm. `use_grad` switches the hybrid behaviour on: after the discrete
+// moves, every survivor's weights are unfrozen and tuned by forward-mode gradient.
+// Returns the best program; appends the per-generation best loss to `history`.
+fn evolve(seed: i64, gens: i64, use_grad: bool, st: Stats @Mut, history: Vec<i64> @Mut) -> Program ! { Alloc } {
+    let r: Rng = Rng { s: seed % 2147483648 };
+    let mut pop: Vec<Program> = Vec::new();
+    let mut i: i64 = 0;
+    while i < SEED_COUNT {
+        let q: i64 = pop.push(make_seed(i));
+        i = i + 1;
+    }
+    while pop.len() < POP {
+        let parent: Program = pop.get(rng_below(r, SEED_COUNT));
+        let q2: i64 = pop.push(mutate(parent, r));
+    }
+
+    let mut g: i64 = 0;
+    while g < gens {
+        let mut j: i64 = 0;
+        while j < pop.len() {
+            let p: Program = pop.get(j);
+            let f: i64 = evaluate(p, st);
+            if use_grad {
+                let acc: i64 = finetune(p, st, FINETUNE_ITERS);
+            }
+            j = j + 1;
+        }
+        pop = sort_by_fitness(pop);
+        let champion: Program = pop.get(0);
+        let q3: i64 = history.push(champion.loss);
+
+        let mut next: Vec<Program> = Vec::new();
+        let mut e: i64 = 0;
+        while e < ELITE {
+            let q4: i64 = next.push(clone_program(pop.get(e)));
+            e = e + 1;
+        }
+        while next.len() < POP {
+            let half: i64 = POP / 2;
+            let pa: Program = pop.get(rng_below(r, half));
+            let mut child: Program = pa;
+            if rng_below(r, 2) == 0 {
+                let pb: Program = pop.get(rng_below(r, half));
+                child = crossover(pa, pb, r);
+            }
+            let q5: i64 = next.push(mutate(child, r));
+        }
+        pop = next;
+        g = g + 1;
+    }
+
+    // final scoring so the returned champion's fields reflect its last weights
+    let mut j2: i64 = 0;
+    while j2 < pop.len() {
+        let f2: i64 = evaluate(pop.get(j2), st);
+        j2 = j2 + 1;
+    }
+    pop = sort_by_fitness(pop);
+    let winner: Program = pop.get(0);
+    let q6: i64 = history.push(winner.loss);
+    return winner;
+}
+
+// ── report rendering ─────────────────────────────────────────────────────────
+fn fmt_q(x: i64) -> str ! { Alloc } {
+    let mut s: str = "";
+    let mut m: i64 = x;
+    if x < 0 {
+        s = "-";
+        m = 0 - x;
+    }
+    let ip: i64 = m / SCALE;
+    let frac: i64 = ((m % SCALE) * 10000) / SCALE;
+    let mut fs: str = frac.to_string();
+    while fs.len() < 4 {
+        fs = "0".concat(fs);
+    }
+    return s.concat(ip.to_string()).concat(".").concat(fs);
+}
+
+fn reg_name(i: i64) -> str ! { Alloc } {
+    if i == R_G {
+        return "g";
+    }
+    if i == R_M {
+        return "m";
+    }
+    if i == R_T {
+        return "t";
+    }
+    if i == R_ONE {
+        return "1.0";
+    }
+    if i == R_DELTA {
+        return "DELTA";
+    }
+    if i == R_MNEXT {
+        return "M_NEXT";
+    }
+    return "r".concat(i.to_string());
+}
+
+fn w_name(p: Program, k: i64) -> str ! { Alloc } {
+    return "w".concat(k.to_string()).concat("[").concat(fmt_q(p.w.get(k))).concat("]");
+}
+
+fn fmt_program(p: Program) -> str ! { Alloc } {
+    let mut out: str = "";
+    let n: i64 = p.ops.len();
+    let mut i: i64 = 0;
+    while i < n {
+        let op: i64 = p.ops.get(i);
+        let d: str = reg_name(p.dst.get(i));
+        let a: str = reg_name(p.a.get(i));
+        let bi: i64 = p.b.get(i);
+        let mut line: str = "    ".concat(d).concat(" = ");
+        if op == OP_ADD {
+            line = line.concat(a).concat(" + ").concat(reg_name(bi));
+        }
+        if op == OP_SUB {
+            line = line.concat(a).concat(" - ").concat(reg_name(bi));
+        }
+        if op == OP_MUL {
+            line = line.concat(a).concat(" * ").concat(reg_name(bi));
+        }
+        if op == OP_RELU {
+            line = line.concat("relu(").concat(a).concat(")");
+        }
+        if op == OP_WMUL {
+            line = line.concat(a).concat(" * ").concat(w_name(p, bi));
+        }
+        if op == OP_WADD {
+            line = line.concat(a).concat(" + ").concat(w_name(p, bi));
+        }
+        if op == OP_STEP {
+            line = line.concat("step(").concat(a).concat(" * ").concat(w_name(p, bi)).concat(")");
+        }
+        if op == OP_NEG {
+            line = line.concat("-").concat(a);
+        }
+        out = out.concat(line).concat("\n");
+        i = i + 1;
+    }
+    return out;
+}
+
+fn fmt_history(label: str, h: Vec<i64>) -> str ! { Alloc } {
+    let mut out: str = "";
+    let mut i: i64 = 0;
+    while i < h.len() {
+        out = out.concat("  ").concat(label).concat(" gen ");
+        let gs: str = i.to_string();
+        if gs.len() < 2 {
+            out = out.concat(" ");
+        }
+        out = out.concat(gs).concat("  best loss = ").concat(fmt_q(h.get(i)));
+        if i == h.len() - 1 {
+            out = out.concat("   (final)");
+        }
+        out = out.concat("\n");
+        i = i + 1;
+    }
+    return out;
+}
+
+// how many weights the gradient (or mutation) moved away from the seed's compiled values
+fn weights_moved(p: Program) -> i64 ! { Alloc } {
+    let seedp: Program = make_seed(p.lineage);
+    let mut moved: i64 = 0;
+    let mut k: i64 = 0;
+    while k < NW {
+        if p.w.get(k) != seedp.w.get(k) {
+            moved = moved + 1;
+        }
+        k = k + 1;
+    }
+    return moved;
+}
+
+fn emit(s: str) -> i64 ! { Alloc } {
+    let n: i64 = s.len();
+    let buf: i64 = alloc(n);
+    let mut i: i64 = 0;
+    while i < n {
+        store8(buf + i, s.byte_at(i));
+        i = i + 1;
+    }
+    return buf * 4294967296 + n;
+}
+
+// ── entry ────────────────────────────────────────────────────────────────────
+pub fn tool_main(input_ptr: i64, input_len: i64) -> i64 ! { Alloc } {
+    let mut seed: i64 = 42;
+    let mut gens: i64 = 12;
+    let parsed: Option<str> = input_ptr.from_bytes(input_len);
+    if parsed.is_some() {
+        let text: str = parsed.unwrap_or("");
+        let parts: Vec<str> = text.trim().split_on(" ");
+        if parts.len() >= 1 {
+            let s0: Option<i64> = parts.get(0).trim().parse_i64();
+            if s0.is_some() {
+                seed = s0.unwrap_or(42);
+            }
+        }
+        if parts.len() >= 2 {
+            let g0: Option<i64> = parts.get(1).trim().parse_i64();
+            if g0.is_some() {
+                gens = g0.unwrap_or(12);
+            }
+        }
+    }
+    if gens < 1 {
+        gens = 1;
+    }
+    if gens > 40 {
+        gens = 40;
+    }
+
+    // Arm A: discrete-only (the autoresearch baseline — structure + blind weight walks).
+    let st_a: Stats = Stats { evals: 0, grad_evals: 0, ft_accepts: 0, ft_rejects: 0 };
+    let mut hist_a: Vec<i64> = Vec::new();
+    let best_a: Program = evolve(seed, gens, false, st_a, hist_a);
+
+    // Arm B: hybrid — the same seed, plus gradient fine-tuning of unfrozen weights.
+    let st_b: Stats = Stats { evals: 0, grad_evals: 0, ft_accepts: 0, ft_rejects: 0 };
+    let mut hist_b: Vec<i64> = Vec::new();
+    let best_b: Program = evolve(seed, gens, true, st_b, hist_b);
+
+    let mut out: str = "autoresearch.sigil — programs-are-neural-networks edition (Q16 fixed point)\n";
+    out = out.concat(f"seed={seed} generations={gens} population={POP} inner_steps={INNER_STEPS}\n");
+    out = out.concat("task: minimize (p0-3)^2 + 50(p1+2)^2 from (-4,3) in 20 steps with an evolved update rule\n\n");
+
+    out = out.concat("[arm A] discrete-only: structural mutation + blind weight walks\n");
+    out = out.concat(fmt_history("A", hist_a));
+    out = out.concat("[arm B] hybrid: same discrete moves, then forward-mode gradient on unfrozen weights\n");
+    out = out.concat(fmt_history("B", hist_b));
+
+    out = out.concat("\nwinner A  (lineage ").concat(lineage_name(best_a.lineage)).concat(")  loss=").concat(fmt_q(best_a.loss));
+    out = out.concat(f"  instrs={best_a.ops.len()}\n").concat(fmt_program(best_a));
+    out = out.concat("winner B  (lineage ").concat(lineage_name(best_b.lineage)).concat(")  loss=").concat(fmt_q(best_b.loss));
+    out = out.concat(f"  instrs={best_b.ops.len()}\n").concat(fmt_program(best_b));
+
+    let moved_a: i64 = weights_moved(best_a);
+    let moved_b: i64 = weights_moved(best_b);
+    out = out.concat("\ncomposition: hand-coded seed weights moved — A: ").concat(moved_a.to_string());
+    out = out.concat("/8 (by random walk)   B: ").concat(moved_b.to_string()).concat("/8 (by gradient + walk)\n");
+    out = out.concat(f"cost: A evals={st_a.evals}   B evals={st_b.evals} + gradient passes={st_b.grad_evals}");
+    out = out.concat(f"  (finetune accepted={st_b.ft_accepts} rejected={st_b.ft_rejects})\n");
+    let ratio: i64 = (st_b.evals + st_b.grad_evals) / st_a.evals;
+    out = out.concat(f"note: arm B spends ~{ratio}x arm A's inner-loop passes; this compares search REPRESENTATION, not compute-matched budgets\n");
+
+    // A verdict needs a margin: Q16 resolution is ~1.5e-5, so two losses within max(1%, one
+    // part in 2^10) of each other are a TIE, not a win. Fail closed toward "not supported".
+    let gap: i64 = best_a.loss - best_b.loss;
+    let mut margin: i64 = best_a.loss / 100;
+    if margin < 64 {
+        margin = 64;
+    }
+    let mut verdict: str = "verdict: TIE within Q16 margin — landscape claim neither supported nor refuted on this seed\n";
+    if gap > margin {
+        verdict = "verdict: hybrid beat discrete — gradient on compiled weights found lower loss than blind search\n";
+    }
+    if gap < 0 - margin {
+        verdict = "verdict: discrete beat hybrid on this seed — landscape claim NOT supported here\n";
+    }
+    out = out.concat("gap (A - B) = ").concat(fmt_q(gap)).concat("  margin = ").concat(fmt_q(margin)).concat("\n");
+    out = out.concat(verdict);
+    return emit(out);
+}
