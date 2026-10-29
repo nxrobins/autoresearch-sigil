@@ -18,6 +18,14 @@ By design, training runs for a **fixed 5-minute time budget** (wall clock, exclu
 
 If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
 
+## SIGIL CPU search
+
+The [library-based SIGIL implementation](sigil/README.md) runs bounded candidate
+search and checkpoint/resume using pinned SIGIL packages. It needs no GPU or
+Torch installation. Select the original quadratic proxy or fixed-dataset
+regression with `--workload`; neither runs the real model-training trial
+described below. The original standalone SIGIL implementation is retained.
+
 ## Quick start
 
 **Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).

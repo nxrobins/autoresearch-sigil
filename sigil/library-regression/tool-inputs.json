@@ -1,0 +1,20 @@
+{
+  "files": {
+    "API.md": "sha256:e1c8399ffea246728c092a3540375d947c909ca48cb448758e8aeeac5ecba042",
+    "PROVENANCE.md": "sha256:e812da2702f46f025cf34c7a05f9c6030b8a77cb82592f30f8963846aed031e2",
+    "README.md": "sha256:643006186355e5241147631297a43249b9f87977ccac5e9b887b1fadc6e3e128",
+    "api-card.json": "sha256:d9544ad20867325ba0e8c265b031d3183848670c424fbdaab3ea22ff1e5283cb",
+    "dataset.json": "sha256:cfceb930a1c790cc8cb51c38ac5643903af9bf7d7db9b45df3ac7a2f38d3fa68",
+    "search.py": "sha256:83bf2c3d4bb4b2224f8264644987e6b577605baa771aa76e96240359424f4e12",
+    "src/tool.sigil": "sha256:2bee956469bb8219cca0959e352007bc27d7ef9b2dd78a5f6f85cb7c8044594e",
+    "src/tool_dataset.sigil": "sha256:98d48f04fb3b94197cc8f14f66df4644529245985afafbf689b240a1573e2a45",
+    "src/tool_exchange.sigil": "sha256:3ac814b7b40611260729eaa204afac1ff0c41c2ce927ca24a4d7e33b124035a5",
+    "src/tool_fit.sigil": "sha256:d7ff2c98f9d539a8cfce52bd07e807ac1e0c9b9ef739ff8a4446c9f462f82e3e",
+    "src/tool_population.sigil": "sha256:a58dcf29ab6f0cfe97c727e0fc95656582d28d1961d3d8ca95dcd72412ff2bda",
+    "src/tool_records.sigil": "sha256:454ff456e078c63c754f02697dccf53211ecc674ca48f9240ff975561b0d61ef",
+    "src/tool_report.sigil": "sha256:4be7a1c8e0eabd40b0d3b7102056f7479714f504b7a99cdb9bc63cb627a534f6",
+    "src/tool_search.sigil": "sha256:5e8d3e0130a5dfbddc7c78e59a37b04c9851be88218b587e18a5e7a2f1c17601",
+    "src/tool_state.sigil": "sha256:b3f87f4d3e67b3ed712f0ef92bbc53285dbdec65b1ffaa4154a022136ae43882"
+  },
+  "scope": "pinned public regression clone inputs; not admission evidence"
+}
