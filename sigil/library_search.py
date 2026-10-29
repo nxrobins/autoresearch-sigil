@@ -21,6 +21,16 @@ import tempfile
 ROOT = Path(__file__).resolve().parent
 PACKAGE = ROOT / "library-search"
 PIN = ROOT / "sigil-source.json"
+WORKLOADS = {
+    "quadratic": ("library-search", "library/programs/autoresearch"),
+    "regression": ("library-regression", "library/programs/autoresearch-regression"),
+}
+
+
+def package_for(workload):
+    if workload not in WORKLOADS:
+        raise ValueError("unsupported search workload")
+    return ROOT / WORKLOADS[workload][0]
 
 
 def relative(value):
@@ -42,19 +52,31 @@ def read_regular(root, name):
     return path.read_bytes()
 
 
-def load_pin():
+def load_pin(workload="quadratic"):
+    package = package_for(workload)
     pin = json.loads(read_regular(ROOT, PIN.name))
-    if pin.get("format") != "autoresearch-sigil-source-v1":
+    if pin.get("format") != "autoresearch-sigil-source-v2":
         raise ValueError("unsupported SIGIL source pin")
+    if set(pin["workloads"]) != set(WORKLOADS):
+        raise ValueError("expected both pinned search workloads")
+    selected = pin["workloads"][workload]
+    if selected["source"] != WORKLOADS[workload][1]:
+        raise ValueError("workload source differs from its declared profile")
     if re.fullmatch(r"[0-9a-f]{40}", pin["commit"]) is None:
         raise ValueError("SIGIL source must be pinned to a complete commit")
     if len(pin["dependencies"]) != 9:
         raise ValueError("expected the nine pinned search libraries")
-    for name, expected in pin["consumer_files"].items():
-        actual = hashlib.sha256(read_regular(PACKAGE, name)).hexdigest()
+    for name, expected in selected["consumer_files"].items():
+        actual = hashlib.sha256(read_regular(package, name)).hexdigest()
         if actual != expected:
             raise ValueError(f"consumer pin mismatch: {name}; use an explicit upgrade")
-    manifest = json.loads(read_regular(PACKAGE, "sigil-package.json"))
+    manifest = json.loads(read_regular(package, "sigil-package.json"))
+    required = {"sigil-package.json", "sigil-package.lock.json", "tool-inputs.json",
+                "README.md", "PROVENANCE.md", "API.md", "api-card.json", "search.py"}
+    required.update(f"src/{name}.sigil" for name in manifest["modules"])
+    required.add("dataset.json" if workload == "regression" else "SEARCH_API.md")
+    if set(selected["consumer_files"]) != required:
+        raise ValueError("workload input inventory differs from its manifest")
     declared = {entry["package"]: entry for entry in manifest["dependencies"]}
     if set(declared) != set(pin["dependencies"]):
         raise ValueError("consumer dependencies differ from the source pin")
@@ -64,7 +86,7 @@ def load_pin():
                 or declared[identity]["requirement"] != "=" + entry["version"]
                 or re.fullmatch(r"[0-9a-f]{40}", entry["tree"]) is None):
             raise ValueError("dependency version, content or tree pin differs")
-    return pin
+    return {**pin, **selected}
 
 
 def git(checkout, *arguments):
@@ -127,14 +149,15 @@ def verify(cli, package=PACKAGE):
     return certificate
 
 
-def setup(cli, checkout):
-    pin = load_pin()
-    cache = PACKAGE / ".sigil"
+def setup(cli, checkout, workload="quadratic"):
+    pin = load_pin(workload)
+    package = package_for(workload)
+    cache = package / ".sigil"
     if cache.is_symlink():
         raise ValueError("dependency cache must not be a symlink")
     if cache.exists():
         # Existing state is checked, never re-locked or repaired in place.
-        return verify(cli)
+        return verify(cli, package)
     with tempfile.TemporaryDirectory(prefix="autoresearch-pinned-") as directory:
         staging = Path(directory)
         providers = materialize(checkout, pin, staging / "providers")
@@ -145,24 +168,26 @@ def setup(cli, checkout):
             output = consumer / relative(name)
             output.parent.mkdir(parents=True, exist_ok=True)
             with output.open("xb") as stream:
-                stream.write(read_regular(PACKAGE, name))
+                stream.write(read_regular(package, name))
         arguments = ["package-lock", "--root", str(consumer)]
         for identity, provider in sorted(providers.items()):
             arguments += ["--dependency", f"{identity}={provider}"]
         checked(cli, *arguments)
         if (json.loads(read_regular(consumer, "sigil-package.lock.json"))
-                != json.loads(read_regular(PACKAGE, "sigil-package.lock.json"))):
+                != json.loads(read_regular(package, "sigil-package.lock.json"))):
             raise ValueError("derived lock differs from the committed pin; no automatic refresh")
         verify(cli, consumer)
         # copytree refuses an existing destination. A partial failed copy is
         # retained and will fail later validation, never silently replaced.
         shutil.copytree(consumer / ".sigil", cache)
-    return verify(cli)
+    return verify(cli, package)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("action", choices=("setup", "search"))
+    parser.add_argument("--workload", choices=tuple(WORKLOADS), default="quadratic",
+                        help="pinned application; default: quadratic")
     parser.add_argument("--sigil", default="sigil", help="solver-enabled SIGIL executable")
     parser.add_argument("--sigil-checkout", type=Path, help="local checkout containing the pinned commit")
     args, forwarded = parser.parse_known_args()
@@ -170,21 +195,25 @@ def main():
         if args.action == "setup":
             if args.sigil_checkout is None or forwarded:
                 raise ValueError("setup requires --sigil-checkout and accepts no search options")
-            certificate = setup(args.sigil, args.sigil_checkout)
-            print(json.dumps({"status": "ready", "source_commit": load_pin()["commit"],
+            certificate = setup(args.sigil, args.sigil_checkout, args.workload)
+            print(json.dumps({"status": "ready", "workload": args.workload,
+                              "source_commit": load_pin(args.workload)["commit"],
                               "artifact_identity_hash": certificate["artifact_identity_hash"]}, indent=2))
             return 0
         if args.sigil_checkout is not None:
             raise ValueError("--sigil-checkout is only used for setup")
         allowed = {"--seed", "--stream", "--generations", "--steps", "--arm", "--budget",
                    "--transitions", "--evaluation", "--job-id", "--resume", "--out-dir", "--help"}
+        if args.workload == "regression":
+            allowed.add("--dataset-sha256")
         for value in forwarded:
             if value.startswith("--") and value.split("=", 1)[0] not in allowed:
                 raise ValueError("unsupported search option; package and storage overrides are disabled")
-        load_pin()
-        verify(args.sigil)
-        return subprocess.run([sys.executable, str(PACKAGE / "search.py"), "--sigil", args.sigil,
-                               "--package", str(PACKAGE), *forwarded], env=cli_environment()).returncode
+        load_pin(args.workload)
+        package = package_for(args.workload)
+        verify(args.sigil, package)
+        return subprocess.run([sys.executable, str(package / "search.py"), "--sigil", args.sigil,
+                               "--package", str(package), *forwarded], env=cli_environment()).returncode
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         print(f"library search refused: {error}", file=sys.stderr)
         return 1

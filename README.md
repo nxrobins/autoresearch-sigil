@@ -22,8 +22,9 @@ If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/s
 
 The [library-based SIGIL implementation](sigil/README.md) runs bounded candidate
 search and checkpoint/resume using pinned SIGIL packages. It needs no GPU or
-Torch installation. It scores a quadratic CPU proxy, not the real model-training
-trial described below. The original standalone SIGIL implementation is retained.
+Torch installation. Select the original quadratic proxy or fixed-dataset
+regression with `--workload`; neither runs the real model-training trial
+described below. The original standalone SIGIL implementation is retained.
 
 ## Quick start
 

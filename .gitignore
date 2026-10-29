@@ -24,3 +24,4 @@ results.tsv
 
 # Pinned SIGIL source is tracked; only generated dependency/cache data is local.
 /sigil/library-search/.sigil/
+/sigil/library-regression/.sigil/
